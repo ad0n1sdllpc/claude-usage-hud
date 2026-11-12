@@ -532,8 +532,84 @@ def tray_left() -> int | None:
     return None
 
 
+def native_hwnd(widget) -> int:
+    u = ctypes.windll.user32
+    u.GetAncestor.restype = ctypes.c_void_p
+    u.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    return u.GetAncestor(widget.winfo_id(), 2) or widget.winfo_id()  # GA_ROOT
+
+
+def make_overlay(widget):
+    """Behave like part of the taskbar: survive Aero Peek, no Alt-Tab entry."""
+    try:
+        hwnd = native_hwnd(widget)
+        on = ctypes.c_int(1)
+        # DWMWA_EXCLUDED_FROM_PEEK = 12: don't fade out when hovering taskbar thumbnails
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            ctypes.c_void_p(hwnd), 12, ctypes.byref(on), ctypes.sizeof(on))
+        u = ctypes.windll.user32
+        u.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        u.SetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_long]
+        ex = u.GetWindowLongW(hwnd, -20)  # GWL_EXSTYLE
+        u.SetWindowLongW(hwnd, -20, ex | 0x80)  # WS_EX_TOOLWINDOW
+    except Exception:
+        pass
+
+
+def raise_hwnd_topmost(hwnd: int):
+    """Re-assert always-on-top without activating or repainting (no flicker)."""
+    try:
+        u = ctypes.windll.user32
+        u.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+        # HWND_TOPMOST; SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS
+        u.SetWindowPos(hwnd, ctypes.c_void_p(-1), 0, 0, 0, 0, 0x1 | 0x2 | 0x10 | 0x200 | 0x4000)
+    except Exception:
+        pass
+
+
+def raise_topmost(widget):
+    raise_hwnd_topmost(native_hwnd(widget))
+
+
+WINEVENTPROC = ctypes.WINFUNCTYPE(None, ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p,
+                                  ctypes.c_long, ctypes.c_long, ctypes.c_uint, ctypes.c_uint)
+
+
+def watch_zorder(get_hwnds):
+    """Re-raise our windows the instant another app shows, hides or reorders one.
+
+    Hovering between taskbar previews brings the taskbar above us; reacting to
+    the event instead of polling closes that gap. Runs on its own thread with
+    its own message loop (the hook can't run inside Tk's loop), and only calls
+    SetWindowPos on raw handles, never Tk. Events from our own process are
+    skipped, so our own re-raise can't trigger itself.
+    """
+    def run():
+        u = ctypes.windll.user32
+        u.SetWinEventHook.restype = ctypes.c_void_p
+        u.SetWinEventHook.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p, WINEVENTPROC,
+                                      ctypes.c_uint, ctypes.c_uint, ctypes.c_uint]
+
+        def on_event(*_):
+            for hwnd in get_hwnds():
+                if hwnd:
+                    raise_hwnd_topmost(hwnd)
+
+        proc = WINEVENTPROC(on_event)  # must stay referenced while hooked
+        flags = 0x0000 | 0x0002  # WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
+        u.SetWinEventHook(0x0003, 0x0003, None, proc, 0, 0, flags)  # EVENT_SYSTEM_FOREGROUND
+        u.SetWinEventHook(0x8002, 0x8004, None, proc, 0, 0, flags)  # OBJECT_SHOW / HIDE / REORDER
+        msg = ctypes.create_string_buffer(64)  # MSG struct
+        while u.GetMessageW(msg, None, 0, 0) > 0:
+            u.TranslateMessage(msg)
+            u.DispatchMessageW(msg)
+
+    threading.Thread(target=run, daemon=True).start()
+
+
 TRAY_GAP = 8
-RUN_KEY =r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 
 def autostart_enabled() -> bool:
@@ -611,6 +687,7 @@ class HudApp:
             self.docked = True
             x, y = self.docked_pos()
         self.root.geometry(f"{self.w}x{self.h}+{x}+{y}")
+        self.pos = (x, y)
 
         self.label = tk.Label(self.root, bd=0, bg="#ff00fe", cursor="hand2")
         self.label.pack()
@@ -635,10 +712,15 @@ class HudApp:
         self.menu.add_command(label="Quit", command=self.root.destroy)
 
         self.redraw()
+        self.root.update_idletasks()
+        make_overlay(self.root)
+        # Raw window handles the hook thread may raise (it must not touch Tk).
+        self.hwnds = [native_hwnd(self.root), 0]  # [widget, popup]
+        watch_zorder(lambda: list(self.hwnds))
         self.refresh()
         self.root.after(250, self.pump)
         self.root.after(500, self.blink)
-        self.root.after(1500, self.keep_on_top)
+        self.root.after(500, self.keep_on_top)
         self.root.after(60_000, self.redraw_tick)
 
     # --- drawing -----------------------------------------------------------
@@ -667,14 +749,17 @@ class HudApp:
         self.root.after(500, self.blink)
 
     def keep_on_top(self):
-        # Clicking the taskbar raises it above us; quietly take the top spot back.
-        self.root.attributes("-topmost", True)
-        self.root.lift()
+        # Safety net behind the event hook: re-assert topmost, no repaint or focus.
+        raise_topmost(self.root)
         if self.docked and not getattr(self, "moved", False):
             x, y = self.docked_pos()
-            if (x, y) != (self.root.winfo_x(), self.root.winfo_y()):
-                self.root.geometry(f"+{x}+{y}")
-        self.root.after(1500, self.keep_on_top)
+            if (x, y) != self.pos:
+                self.move_to(x, y)
+        self.root.after(500, self.keep_on_top)
+
+    def move_to(self, x: int, y: int):
+        self.pos = (x, y)
+        self.root.geometry(f"+{x}+{y}")
 
     def docked_pos(self) -> tuple[int, int]:
         left = tray_left()
@@ -695,18 +780,22 @@ class HudApp:
             self.popup.attributes("-transparentcolor", "#ff00fe")
             self.popup_label = tk.Label(self.popup, bd=0, bg="#ff00fe")
             self.popup_label.pack()
+            self.popup.update_idletasks()
+            make_overlay(self.popup)
+            self.hwnds[1] = native_hwnd(self.popup)
         self.popup_photo = photo
         self.popup_label.configure(image=photo)
         pw, ph = pix.w * self.scale, pix.h * self.scale
-        x = self.root.winfo_x() + self.w - pw
+        x = self.pos[0] + self.w - pw
         x = max(0, min(x, self.root.winfo_screenwidth() - pw))
-        y = self.root.winfo_y() - ph - 6
+        y = self.pos[1] - ph - 6
         if y < 0:  # taskbar at the top of the screen
-            y = self.root.winfo_y() + self.h + 6
+            y = self.pos[1] + self.h + 6
         self.popup.geometry(f"{pw}x{ph}+{x}+{y}")
 
     def hide_popup(self):
         if self.popup:
+            self.hwnds[1] = 0
             self.popup.destroy()
             self.popup = None
 
@@ -738,19 +827,19 @@ class HudApp:
 
     # --- interaction -----------------------------------------------------------
     def on_press(self, e):
-        self.drag = (e.x_root - self.root.winfo_x(), e.y_root - self.root.winfo_y())
+        self.drag = (e.x_root - self.pos[0], e.y_root - self.pos[1])
         self.moved = False
         self.hide_popup()
 
     def on_drag(self, e):
         self.moved = True
-        self.root.geometry(f"+{e.x_root - self.drag[0]}+{e.y_root - self.drag[1]}")
+        self.move_to(e.x_root - self.drag[0], e.y_root - self.drag[1])
 
     def on_release(self, e):
         if self.moved:
             self.moved = False
             self.docked = False
-            self.cfg.update(x=self.root.winfo_x(), y=self.root.winfo_y())
+            self.cfg.update(x=self.pos[0], y=self.pos[1])
             save_config(self.cfg)
         else:
             self.refresh()  # a simple click refreshes
@@ -767,8 +856,7 @@ class HudApp:
 
     def reset_position(self):
         self.docked = True
-        x, y = self.docked_pos()
-        self.root.geometry(f"+{x}+{y}")
+        self.move_to(*self.docked_pos())
         self.cfg.pop("x", None)
         self.cfg.pop("y", None)
         save_config(self.cfg)
