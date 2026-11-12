@@ -22,7 +22,18 @@ pythonw claude_usage_hud.pyw
 - **Click** to refresh
 - By default it docks just left of the tray arrow and follows it as tray icons come and go
 - **Drag** to move it anywhere (the position is saved)
-- **Right-click** for Refresh, Start with Windows, Dock next to tray, and Quit
+- **Right-click** for Refresh, Start with Windows, Sound effects, Dock next to tray, and Quit
+
+### 8-bit sound effects
+
+| When | Sound |
+|---|---|
+| A bar crosses 80% | two-note warning blip |
+| A bar hits 100% | descending "game over" jingle |
+| A limit resets (bar drops by 30+ points) | rising "level up" jingle |
+
+The sounds are synthesized in memory, so there are no audio files. Each one plays once per event, never on startup.
+Preview them with `python claude_usage_hud.pyw --sound-test`.
 
 Try it without real data:
 

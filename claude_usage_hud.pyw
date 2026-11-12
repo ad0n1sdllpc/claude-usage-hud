@@ -206,6 +206,61 @@ def demo_usage(tick: int) -> Usage:
     )
 
 
+# --------------------------------------------------------------------------
+# 8-bit sounds, synthesized in memory (square waves) and played via winsound
+# --------------------------------------------------------------------------
+SAMPLE_RATE = 22050
+SOUNDS = {  # (frequency Hz or 0 for rest, milliseconds)
+    "warning": [(1319, 70), (0, 40), (1319, 70)],
+    "gameover": [(784, 130), (659, 130), (523, 130), (392, 380)],
+    "levelup": [(523, 80), (659, 80), (784, 80), (1047, 240)],
+}
+
+
+def synth_wav(notes: list[tuple[int, int]], volume: int = 36) -> bytes:
+    """8-bit mono WAV of square-wave notes with a short fade to avoid clicks."""
+    data = bytearray()
+    for freq, ms in notes:
+        n = SAMPLE_RATE * ms // 1000
+        for i in range(n):
+            if freq == 0:
+                data.append(128)
+                continue
+            fade = min(1.0, (n - i) / (SAMPLE_RATE * 0.02))  # 20 ms release
+            high = (i * freq * 2 // SAMPLE_RATE) % 2 == 0
+            data.append(128 + int((volume if high else -volume) * fade))
+    header = b"RIFF" + struct.pack("<I", 36 + len(data)) + b"WAVEfmt "
+    header += struct.pack("<IHHIIHH", 16, 1, 1, SAMPLE_RATE, SAMPLE_RATE, 1, 8)
+    return header + b"data" + struct.pack("<I", len(data)) + bytes(data)
+
+
+def play_sound(name: str):
+    def run():
+        try:
+            import winsound
+            winsound.PlaySound(synth_wav(SOUNDS[name]), winsound.SND_MEMORY)
+        except Exception:
+            pass
+    threading.Thread(target=run, daemon=True).start()
+
+
+def sound_event(old: Usage, new: Usage) -> str | None:
+    """Which jingle (if any) a data update deserves. Never fires on first load."""
+    if old.status != "ok" or new.status != "ok":
+        return None
+    event = None
+    for before, after in ((old.session, new.session), (old.week, new.week)):
+        if before.pct is None or after.pct is None:
+            continue
+        if before.pct < 100 <= after.pct:
+            return "gameover"
+        if before.pct < 80 <= after.pct:
+            event = "warning"
+        elif after.pct <= before.pct - 30 and event is None:
+            event = "levelup"  # the limit window reset
+    return event
+
+
 def fmt_countdown(when: datetime | None) -> str:
     if not when:
         return "--"
@@ -573,6 +628,8 @@ class HudApp:
         self.menu.add_command(label="Refresh now", command=self.refresh)
         self.menu.add_checkbutton(label="Start with Windows", variable=self.autostart,
                                   command=lambda: set_autostart(self.autostart.get()))
+        self.sound = tk.BooleanVar(value=self.cfg.get("sound", True))
+        self.menu.add_checkbutton(label="Sound effects", variable=self.sound, command=self.toggle_sound)
         self.menu.add_command(label="Dock next to tray", command=self.reset_position)
         self.menu.add_separator()
         self.menu.add_command(label="Quit", command=self.root.destroy)
@@ -665,7 +722,11 @@ class HudApp:
     def pump(self):
         try:
             while True:
-                self.usage = self.results.get_nowait()
+                new = self.results.get_nowait()
+                event = sound_event(self.usage, new)
+                if event and self.sound.get():
+                    play_sound(event)
+                self.usage = new
                 self.redraw()
         except queue.Empty:
             pass
@@ -698,6 +759,12 @@ class HudApp:
         self.hide_popup()
         self.menu.tk_popup(e.x_root, e.y_root)
 
+    def toggle_sound(self):
+        self.cfg["sound"] = self.sound.get()
+        save_config(self.cfg)
+        if self.sound.get():
+            play_sound("levelup")  # a little confirmation it's on
+
     def reset_position(self):
         self.docked = True
         x, y = self.docked_pos()
@@ -713,6 +780,13 @@ class HudApp:
 def main():
     args = sys.argv[1:]
     demo = "--demo" in args
+    if "--sound-test" in args:
+        import winsound
+        for name in SOUNDS:
+            print(f"playing {name}")
+            winsound.PlaySound(synth_wav(SOUNDS[name]), winsound.SND_MEMORY)
+            time.sleep(0.4)
+        return
     if "--snapshot" in args:
         out = args[args.index("--snapshot") + 1]
         if demo:
